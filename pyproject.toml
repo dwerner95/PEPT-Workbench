@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pept-gui"
+version = "0.1.0"
+description = "PEPT desktop GUI for visualising LoRs and building processing pipelines"
+readme = "README.md"
+authors = [
+  { name = "Dominik's coding agent" }
+]
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "pept",
+  "PySide6",
+  "plotly",
+  "numpy",
+  "joblib"
+]
+
+[project.optional-dependencies]
+export = ["kaleido"]
+
+[project.scripts]
+pept-gui = "pept_gui.app:main"
+
+[tool.pytest.ini_options]
+markers = [
+  "integration: tests that exercise the full PEPT stack and sample datasets",
+]
