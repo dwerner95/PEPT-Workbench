@@ -96,3 +96,14 @@ def test_compile_pipeline_handles_condition_varargs():
     pipeline = compile_pipeline(graph.as_pipeline_definition())
     result = pipeline.fit(np.zeros((1, 7)))
     assert len(result["steps"]) == 2
+
+
+@pytest.mark.usefixtures("fake_pept_bridge")
+def test_compile_pipeline_recognises_splitlabels_as_reducer():
+    graph = PipelineGraph()
+    graph.add_node("SplitLabels")
+
+    pipeline = compile_pipeline(graph.as_pipeline_definition())
+    result = pipeline.fit(np.zeros((4, 7)))
+
+    assert len(result["steps"]) == 1

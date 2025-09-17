@@ -16,9 +16,17 @@ TRANSFORMER_PATHS: dict[str, tuple[str, ...]] = {
     "Stack": ("pept.tracking.Stack", "pept.reducers.Stack"),
     "Cutpoints": ("pept.tracking.Cutpoints",),
     "HDBSCAN": ("pept.tracking.HDBSCAN",),
-    "SplitLabels": ("pept.reducers.SplitLabels",),
+    "SplitLabels": ("pept.tracking.SplitLabels", "pept.reducers.SplitLabels"),
     "Centroids": ("pept.tracking.Centroids",),
     "Segregate": ("pept.tracking.Segregate",),
+}
+
+
+REDUCER_NAMES: set[str] = {
+    "Stack",
+    "SplitLabels",
+    "GroupBy",
+    "SplitAll",
 }
 
 
@@ -81,7 +89,7 @@ def compile_pipeline(nodes: Iterable[dict[str, Any]]) -> "pept.Pipeline":
         if transformer is None:
             raise KeyError(f"Unknown transformer {node_type!r}")
         instance = transformer(*positional, **params)
-        if instance.__class__.__module__.startswith("pept.reducers"):
+        if node_type in REDUCER_NAMES or instance.__class__.__module__.startswith("pept.reducers"):
             reducers_present = True
         steps.append(instance)
 
