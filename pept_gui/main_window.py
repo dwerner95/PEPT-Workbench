@@ -29,6 +29,11 @@ from .model import (
     registered_transformer_names,
     resolve_transformer,
 )
+from .model.sample_analysis import (
+    SampleWindow,
+    annotate_points_with_samples,
+    build_sample_windows,
+)
 from .view import (
     ControlsPanel,
     DiagnosticsView,
@@ -58,6 +63,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset: LoadedDataset | None = None
         self._descriptor: DatasetDescriptor | None = None
         self._time_mask = TimeMask(0.0, 10.0)
+        self._timeline_start = 0.0
+        self._timeline_end = 10.0
         self._decimation = 10
         self._sample_size = 0
         self._overlap = 0
@@ -65,6 +72,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_limit = 1000
         self._transformer_registry: dict[str, Any] = {}
         self._trajectory_colour = "t"
+        self._sample_windows: list[SampleWindow] = []
+        self._latest_points: tuple[np.ndarray, list[str], np.ndarray | None] | None = None
+        self._playback_speed = 1.0
+        self._playback_pending = 0.0
+        self._playback_cache: PlaybackCache | None = None
+        self._playback_dirty = True
+        self._play_timer = QtCore.QTimer(self)
+        self._play_timer.setInterval(100)
+        self._play_timer.timeout.connect(self._advance_playback)
 
         self._setup_actions()
         self._setup_toolbars()
@@ -78,6 +94,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controls.set_executor(self._executor)
         self.controls.set_preview_limit(self._preview_limit)
         self.controls.set_trajectory_colour(self._trajectory_colour)
+        self.controls.set_playback_speed(self._playback_speed)
         self.controls.time_mask_changed.connect(self._on_time_mask_changed)
         self.controls.decimation_changed.connect(self._on_decimation_changed)
         self.controls.sample_size_changed.connect(self._on_sample_size_changed)
@@ -85,6 +102,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controls.executor_changed.connect(self._on_executor_changed)
         self.controls.preview_limit_changed.connect(self._on_preview_limit_changed)
         self.controls.trajectory_colour_changed.connect(self._on_trajectory_colour_changed)
+        self.controls.playback_toggled.connect(self._on_playback_toggled)
+        self.controls.playback_speed_changed.connect(self._on_playback_speed_changed)
 
         transformer_registry = available_transformers()
         self._transformer_registry = transformer_registry
@@ -98,6 +117,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.node_editor.parameter_changed.connect(self._on_node_params_changed)
 
         self._update_code_preview()
+        self._update_sample_summary()
 
     # ------------------------------------------------------------------ UI setup
     def _setup_actions(self) -> None:
@@ -161,6 +181,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.controls = ControlsPanel(central)
         self.controls.setMinimumWidth(280)
         layout.addWidget(self.controls)
+        self.controls.set_time_range(self._timeline_start, self._timeline_end)
 
         centre_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, central)
         layout.addWidget(centre_splitter, 1)
@@ -228,6 +249,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Failed to load dataset", "See console for details.")
             return
         self._dataset = dataset
+        self._stop_playback()
         self._refresh_lo_rs()
         self.progress_label.setText(f"Loaded {descriptor.scanner} dataset")
 
@@ -237,6 +259,9 @@ class MainWindow(QtWidgets.QMainWindow):
             end = float(dataset.raw_lines[-1, 0])
             if end <= start:
                 end = start + 1.0
+            self._timeline_start = start
+            self._timeline_end = end
+            self.controls.set_time_range(self._timeline_start, self._timeline_end)
             self._time_mask = TimeMask(start, min(start + 10.0, end))
             self.controls.set_time_mask(self._time_mask)
             self._apply_time_mask()
@@ -308,7 +333,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_run_result(self, result: RunResult) -> None:
         self.run_action.setEnabled(True)
         points, columns = _to_array(result.points)
-        self._latest_points = (points, columns)
+        customdata: np.ndarray | None = None
+        if points.size and points.ndim == 2 and points.shape[1] >= 4 and self._sample_windows:
+            customdata = self._annotate_points(points)
+        self._latest_points = (points, columns, customdata)
         selected = self.controls.update_trajectory_colour_options(columns, preferred=self._trajectory_colour)
         self._trajectory_colour = selected
         self._render_points()
@@ -325,6 +353,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # -------------------------------------------------------------- state mgmt
     def _on_time_mask_changed(self, mask: TimeMask) -> None:
         self._time_mask = mask
+        self._playback_pending = 0.0
         self._apply_time_mask()
 
     def _on_decimation_changed(self, value: int) -> None:
@@ -371,6 +400,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_time_mask(self) -> None:
         if self._dataset is None:
+            self._sample_windows = []
+            self._update_sample_summary()
             return
         self._dataset.masked_lines = self._time_mask.apply(self._dataset.raw_lines)
         self._refresh_lo_rs()
@@ -387,10 +418,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset.preview_lines = lines
         self.lors_view.set_lines(self._dataset.preview_lines, decimated=self._decimation > 1)
         count = self._dataset.masked_lines.shape[0]
-        self.progress_label.setText(f"{count} LoRs in window")
+        self.progress_label.setText(
+            f"{count} LoRs in {self._time_mask.start:.3f}–{self._time_mask.end:.3f} s"
+        )
 
     def _rebuild_line_data(self) -> None:
-        if self._dataset is None or pept is None:
+        if self._dataset is None:
+            return
+
+        lines = self._dataset.masked_lines
+        if lines.size:
+            timestamps = np.asarray(lines[:, 0], dtype=float)
+        else:
+            timestamps = np.array([], dtype=float)
+        self._sample_windows = build_sample_windows(timestamps, self._sample_size, self._overlap)
+        self._update_sample_summary()
+
+        if pept is None or self._play_timer.isActive():
+            self._dataset.line_data = None
             return
         kwargs: dict[str, Any] = {}
         sample_value = prepare_samples_argument(self._sample_size)
@@ -404,6 +449,14 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(f"Failed to rebuild line data: {exc}")
             self._dataset.line_data = None
+
+        if self._latest_points is not None:
+            points, columns, _ = self._latest_points
+            customdata = None
+            if points.size and self._sample_windows:
+                customdata = self._annotate_points(points)
+            self._latest_points = (points, columns, customdata)
+            self._render_points()
 
     def _ensure_line_data(self) -> Any:
         if self._dataset is None:
@@ -425,16 +478,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self._trajectory_colour = value
         self._render_points()
 
+    def _on_playback_toggled(self, active: bool) -> None:
+        if active:
+            if self._dataset is None or self._dataset.raw_lines.size == 0:
+                self.controls.set_playback_state(False)
+                return
+            if not self._playback_can_move():
+                self.statusBar().showMessage(
+                    "Playback requires a time window shorter than the dataset span.",
+                    5000,
+                )
+                self.controls.set_playback_state(False)
+                return
+            self._playback_pending = 0.0
+            if not self._play_timer.isActive():
+                self._play_timer.start()
+                self.statusBar().showMessage("Playback running", 1000)
+        else:
+            self._stop_playback()
+
+    def _on_playback_speed_changed(self, value: float) -> None:
+        self._playback_speed = max(0.01, float(value))
+        self.statusBar().showMessage(f"Playback speed set to {self._playback_speed:.2f}×", 2000)
+
+    def _advance_playback(self) -> None:
+        if self._dataset is None or self._dataset.raw_lines.size == 0:
+            self._stop_playback()
+            return
+        if not self._playback_can_move():
+            self._stop_playback()
+            return
+        interval_seconds = max(self._play_timer.interval(), 1) / 1000.0
+        delta = self._playback_speed * interval_seconds
+        if delta <= 0.0:
+            return
+        self._playback_pending += delta
+        if self._mask_at_end():
+            self._playback_pending = 0.0
+            self._stop_playback()
+            return
+        moved = self.controls.shift_time_mask(self._playback_pending)
+        if moved:
+            self._playback_pending = 0.0
+        elif self._mask_at_end():
+            self._playback_pending = 0.0
+            self._stop_playback()
+
+    def _stop_playback(self) -> None:
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+        self.controls.set_playback_state(False)
+        self._playback_pending = 0.0
+        if self._dataset is not None and self._dataset.line_data is None and pept is not None:
+            self._rebuild_line_data()
+
+    def _mask_at_end(self) -> bool:
+        if self._dataset is None or self._dataset.raw_lines.size == 0:
+            return True
+        max_start = max(self._timeline_start, self._timeline_end - self._time_mask.duration)
+        return self._time_mask.start >= max_start - 1e-9
+
+    def _playback_can_move(self) -> bool:
+        total_span = self._timeline_end - self._timeline_start
+        return total_span > self._time_mask.duration + 1e-9
+
     def _render_points(self) -> None:
         if self._latest_points is None:
             return
-        points, columns = self._latest_points
+        points, columns, customdata = self._latest_points
         if points.size == 0:
             self.traj_view.set_points(points)
             self.traj2d_view.set_points(points, columns, None)
             return
         colour_array, colour_label, resolved_name = _select_colour(points, columns, self._trajectory_colour)
-        self.traj_view.set_points(points, colour=colour_array, colour_label=colour_label)
+        self.traj_view.set_points(points, colour=colour_array, colour_label=colour_label, customdata=customdata)
         self.traj2d_view.set_points(points, columns, resolved_name)
 
     def _current_plot_widget(self) -> Optional[object]:
@@ -459,6 +576,28 @@ class MainWindow(QtWidgets.QMainWindow):
             lines.append(f"    {call},")
         lines.append("])")
         self.code_preview.setPlainText("\n".join(lines))
+
+    def _update_sample_summary(self) -> None:
+        summary = [
+            {
+                "index": window.index,
+                "start": window.start_time,
+                "end": window.end_time,
+                "span": window.span,
+                "count": window.count,
+                "distance": window.distance,
+            }
+            for window in self._sample_windows
+        ]
+        self.diagnostics_view.set_sample_summary(summary)
+
+    def _annotate_points(self, points: np.ndarray) -> np.ndarray:
+        customdata, distances = annotate_points_with_samples(points, self._sample_windows)
+        if distances:
+            for window in self._sample_windows:
+                window.distance = distances.get(window.index, float("nan"))
+            self._update_sample_summary()
+        return customdata
 
 
 # ---------------------------------------------------------------------------

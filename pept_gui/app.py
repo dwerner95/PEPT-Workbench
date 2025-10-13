@@ -33,11 +33,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = MainWindow()
     window.show()
 
-    # On macOS we ensure the application keeps running even when the dock icon is clicked
-    # without windows.
-    if sys.platform == "darwin":
-        app.setQuitOnLastWindowClosed(False)
-
     return app.exec()
 
 

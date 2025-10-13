@@ -8,15 +8,13 @@ constant time windows, and running interactive post-processing pipelines powered
 a drag-and-drop pipeline builder, and Plotly based 3D visualisations embedded inside Qt.
 
 ## Features
-
 - Automatic detection for ADAC Forte, modular camera, and parallel screens datasets.
-- Immutable absolute time masks that guarantee deterministic LoR membership regardless of
-  sampling or adaptive window adjustments.
-- Configurable sample grouping in raw LoR counts, plus adjustable preview limits and colour
-  selection for responsive 3D/2D visualisation (position/time series with mm/ms axes).
+- Immutable absolute time masks that guarantee deterministic LoR membership regardless of sampling or adaptive window adjustments.
+- Time-range slider that locks a fixed-duration window and lets users drag it across the unified timeline while preserving the absolute mask.
+- Configurable sample grouping in raw LoR counts, plus adjustable preview limits and colour selection for responsive 3D/2D visualisation (position/time series with mm/ms axes).
 - Responsive LoR previews and pipeline execution using background worker threads.
-- Visual pipeline canvas focused on the core PEPT-ML steps (Cutpoints → HDBSCAN → SplitLabels →
-  Centroids → Segregate/Stack) with parameter editors, Python code preview, and preset management.
+- Sample window analytics overlay that reports per-sample time spans, LoR counts, and travel distances for selections.
+- Visual pipeline canvas focused on the core PEPT-ML steps (Cutpoints → HDBSCAN → SplitLabels → Centroids → Segregate/Stack) with parameter editors, Python code preview, and preset management.
 - Trajectory, diagnostics, and export panels powered by Plotly and `pept.plots` helpers.
 
 ## Getting Started

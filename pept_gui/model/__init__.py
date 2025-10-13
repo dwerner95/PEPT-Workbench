@@ -8,6 +8,7 @@ from .pept_bridge import (
     resolve_transformer,
 )
 from .run_controller import RunController, RunResult
+from .sample_analysis import SampleWindow, annotate_points_with_samples, build_sample_windows
 
 __all__ = [
     "PipelineGraph",
@@ -18,4 +19,7 @@ __all__ = [
     "available_transformers",
     "registered_transformer_names",
     "resolve_transformer",
+    "SampleWindow",
+    "annotate_points_with_samples",
+    "build_sample_windows",
 ]

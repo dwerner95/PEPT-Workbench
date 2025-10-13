@@ -20,6 +20,9 @@ class ControlsPanel(QtWidgets.QWidget):
     trajectory_colour_changed = QtCore.Signal(str)
     preview_limit_changed = QtCore.Signal(int)
 
+    playback_toggled = QtCore.Signal(bool)
+    playback_speed_changed = QtCore.Signal(float)
+
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QVBoxLayout(self)
@@ -33,20 +36,57 @@ class ControlsPanel(QtWidgets.QWidget):
         dataset_layout.addWidget(self._sources_list)
         layout.addWidget(dataset_group)
 
-        window_group = QtWidgets.QGroupBox("Time Window", self)
-        window_form = QtWidgets.QFormLayout(window_group)
-        self._start_spin = QtWidgets.QDoubleSpinBox(self)
-        self._start_spin.setDecimals(3)
-        self._start_spin.setRange(0.0, 1e9)
-        self._start_spin.valueChanged.connect(self._on_time_changed)
+        self._timeline_start = 0.0
+        self._timeline_end = 10.0
+        self._slider_resolution = 10_000
 
-        self._end_spin = QtWidgets.QDoubleSpinBox(self)
-        self._end_spin.setDecimals(3)
-        self._end_spin.setRange(0.001, 1e9)
-        self._end_spin.setValue(10.0)
-        self._end_spin.valueChanged.connect(self._on_time_changed)
-        window_form.addRow("Start [s]", self._start_spin)
-        window_form.addRow("End [s]", self._end_spin)
+        window_group = QtWidgets.QGroupBox("Time Window", self)
+        window_layout = QtWidgets.QVBoxLayout(window_group)
+
+        window_form = QtWidgets.QFormLayout()
+        self._duration_spin = QtWidgets.QDoubleSpinBox(self)
+        self._duration_spin.setDecimals(3)
+        self._duration_spin.setMinimum(0.001)
+        self._duration_spin.setMaximum(1e9)
+        self._duration_spin.setValue(10.0)
+        self._duration_spin.valueChanged.connect(self._on_duration_changed)
+        window_form.addRow("Duration [s]", self._duration_spin)
+
+        playback_row = QtWidgets.QWidget(self)
+        playback_layout = QtWidgets.QHBoxLayout(playback_row)
+        playback_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._play_button = QtWidgets.QToolButton(self)
+        self._play_button.setText("Play")
+        self._play_button.setCheckable(True)
+        self._update_play_icon(False)
+        self._play_button.toggled.connect(self._on_play_toggled)
+        playback_layout.addWidget(self._play_button)
+
+        self._speed_spin = QtWidgets.QDoubleSpinBox(self)
+        self._speed_spin.setDecimals(3)
+        self._speed_spin.setMinimum(0.01)
+        self._speed_spin.setMaximum(1000.0)
+        self._speed_spin.setSingleStep(0.1)
+        self._speed_spin.setValue(1.0)
+        self._speed_spin.setSuffix("×")
+        self._speed_spin.setToolTip("Seconds of data advanced per real second")
+        self._speed_spin.valueChanged.connect(self._on_speed_changed)
+        playback_layout.addWidget(self._speed_spin, 1)
+
+        window_form.addRow("Playback", playback_row)
+
+        window_layout.addLayout(window_form)
+
+        self._start_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal, self)
+        self._start_slider.setRange(0, self._slider_resolution)
+        self._start_slider.setPageStep(self._slider_resolution // 100 or 1)
+        self._start_slider.valueChanged.connect(self._on_slider_changed)
+        window_layout.addWidget(self._start_slider)
+
+        self._range_label = QtWidgets.QLabel(self)
+        window_layout.addWidget(self._range_label)
+
         layout.addWidget(window_group)
 
         sampling_group = QtWidgets.QGroupBox("Sampling", self)
@@ -102,12 +142,11 @@ class ControlsPanel(QtWidgets.QWidget):
             self._sources_list.addItem(source)
 
     def set_time_mask(self, mask: TimeMask) -> None:
-        self._start_spin.blockSignals(True)
-        self._end_spin.blockSignals(True)
-        self._start_spin.setValue(mask.start)
-        self._end_spin.setValue(mask.end)
-        self._start_spin.blockSignals(False)
-        self._end_spin.blockSignals(False)
+        self._duration_spin.blockSignals(True)
+        self._duration_spin.setValue(max(mask.end - mask.start, 0.001))
+        self._duration_spin.blockSignals(False)
+        self._set_slider_position(mask.start)
+        self._update_range_label(mask.start, mask.end)
 
     def set_sampling(self, *, sample_size: int, overlap: int) -> None:
         self._sample_spin.blockSignals(True)
@@ -143,6 +182,22 @@ class ControlsPanel(QtWidgets.QWidget):
     def current_trajectory_colour(self) -> str:
         return self._traj_colour_combo.currentText()
 
+    def set_playback_state(self, playing: bool) -> None:
+        self._play_button.blockSignals(True)
+        self._play_button.setChecked(playing)
+        self._play_button.blockSignals(False)
+        self._update_play_icon(playing)
+
+    def playback_speed(self) -> float:
+        return float(self._speed_spin.value())
+
+    def set_playback_speed(self, value: float) -> None:
+        clamped = max(self._speed_spin.minimum(), min(self._speed_spin.maximum(), value))
+        self._speed_spin.blockSignals(True)
+        self._speed_spin.setValue(clamped)
+        self._speed_spin.blockSignals(False)
+        self.playback_speed_changed.emit(self.playback_speed())
+
     def update_trajectory_colour_options(self, columns: list[str], preferred: str | None = None) -> str:
         cleaned: list[str] = []
         seen: set[str] = set()
@@ -169,19 +224,108 @@ class ControlsPanel(QtWidgets.QWidget):
         return self._traj_colour_combo.currentText()
 
     def current_time_mask(self) -> TimeMask:
-        return TimeMask(self._start_spin.value(), self._end_spin.value())
+        start = self._current_start()
+        duration = self._duration_spin.value()
+        end = start + duration
+        return TimeMask(start, end)
+
+    def shift_time_mask(self, delta: float) -> bool:
+        if not delta:
+            return False
+        current_start = self._current_start()
+        max_start = self._max_start_value()
+        proposed = max(self._timeline_start, min(max_start, current_start + delta))
+        if abs(proposed - current_start) < 1e-9:
+            return False
+        self._set_slider_position(proposed)
+        self._emit_time_mask()
+        return True
+
+    def set_time_range(self, start: float, end: float) -> None:
+        self._timeline_start = float(max(0.0, start))
+        self._timeline_end = float(max(self._timeline_start + 0.001, end))
+        available = max(self._timeline_end - self._timeline_start, 0.001)
+        self._duration_spin.blockSignals(True)
+        self._duration_spin.setMaximum(available)
+        if self._duration_spin.value() > available:
+            self._duration_spin.setValue(available)
+        self._duration_spin.blockSignals(False)
+        self._ensure_slider_constraints()
+        self._update_range_label(self._current_start(), self._current_start() + self._duration_spin.value())
 
     # ------------------------------------------------------------------- helpers
-    def _on_time_changed(self, _: float) -> None:
-        start = self._start_spin.value()
-        end = self._end_spin.value()
-        if end <= start:
-            end = start + 0.001
-            self._end_spin.blockSignals(True)
-            self._end_spin.setValue(end)
-            self._end_spin.blockSignals(False)
-        mask = TimeMask(start, end)
-        self.time_mask_changed.emit(mask)
+    def _on_duration_changed(self, _: float) -> None:
+        self._ensure_slider_constraints()
+        self._emit_time_mask()
+
+    def _on_slider_changed(self, _: int) -> None:
+        self._emit_time_mask()
 
     def _on_trajectory_colour_changed(self, text: str) -> None:
         self.trajectory_colour_changed.emit(text)
+
+    def _on_play_toggled(self, active: bool) -> None:
+        self._update_play_icon(active)
+        self.playback_toggled.emit(active)
+
+    def _on_speed_changed(self, value: float) -> None:
+        self.playback_speed_changed.emit(float(value))
+
+    def _emit_time_mask(self) -> None:
+        start = self._current_start()
+        duration = self._duration_spin.value()
+        end = start + duration
+        self._update_range_label(start, end)
+        self.time_mask_changed.emit(TimeMask(start, end))
+
+    def _current_start(self) -> float:
+        if self._start_slider.maximum() <= 0:
+            return self._timeline_start
+        fraction = self._start_slider.value() / self._start_slider.maximum()
+        max_start = self._max_start_value()
+        if max_start <= self._timeline_start:
+            return self._timeline_start
+        start = self._timeline_start + fraction * (max_start - self._timeline_start)
+        return min(max_start, start)
+
+    def _set_slider_position(self, start: float) -> None:
+        max_start = self._max_start_value()
+        start = min(max(start, self._timeline_start), max_start)
+        if max_start <= self._timeline_start:
+            self._start_slider.blockSignals(True)
+            self._start_slider.setValue(0)
+            self._start_slider.blockSignals(False)
+            self._start_slider.setEnabled(False)
+            return
+        fraction = (start - self._timeline_start) / (max_start - self._timeline_start)
+        value = int(round(fraction * self._start_slider.maximum()))
+        self._start_slider.blockSignals(True)
+        self._start_slider.setValue(value)
+        self._start_slider.blockSignals(False)
+        self._start_slider.setEnabled(True)
+
+    def _update_range_label(self, start: float, end: float) -> None:
+        self._range_label.setText(f"Start {start:.3f} s → End {end:.3f} s")
+
+    def _ensure_slider_constraints(self) -> None:
+        max_start = self._max_start_value()
+        if max_start <= self._timeline_start:
+            self._start_slider.blockSignals(True)
+            self._start_slider.setValue(0)
+            self._start_slider.blockSignals(False)
+            self._start_slider.setEnabled(False)
+        else:
+            self._start_slider.setEnabled(True)
+            current_start = self._current_start()
+            if current_start > max_start:
+                self._set_slider_position(max_start)
+
+    def _max_start_value(self) -> float:
+        duration = self._duration_spin.value()
+        return max(self._timeline_start, self._timeline_end - duration)
+
+    def _update_play_icon(self, playing: bool) -> None:
+        style = self.style()
+        icon_enum = QtWidgets.QStyle.SP_MediaPause if playing else QtWidgets.QStyle.SP_MediaPlay
+        self._play_button.setIcon(style.standardIcon(icon_enum))
+        self._play_button.setText("Pause" if playing else "Play")
