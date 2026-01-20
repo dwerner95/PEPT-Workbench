@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - import guarded for testing without pep
 ADAC_SUFFIXES = {".da", ".dac", ".daq", ".dat"}
 PARALLEL_SUFFIXES = {".csv"}
 MODULAR_SUFFIXES = {".bin"}
+PICKLE_SUFFIXES = {".pickle", ".pkl"}
 
 
 def prepare_samples_argument(value: Any) -> Any | None:
@@ -101,6 +102,9 @@ def detect_sources(paths: Sequence[str | Path]) -> DatasetDescriptor:
     if _matches(suffixes, MODULAR_SUFFIXES):
         relevant = tuple(sorted(files))
         return DatasetDescriptor("modular_camera", relevant)
+    if _matches(suffixes, PICKLE_SUFFIXES):
+        relevant = tuple(sorted(f for f in files if f.suffix.lower() in PICKLE_SUFFIXES))
+        return DatasetDescriptor("pept_load", relevant)
 
     raise DatasetDetectionError(f"Could not determine scanner type for suffixes: {sorted(suffixes)}")
 
@@ -117,29 +121,37 @@ def load_dataset(
     """Load the dataset described by ``descriptor`` and return filtered LoRs."""
     if pept is None:  # pragma: no cover - executed only without dependency
         raise RuntimeError("The pept package is required to load datasets")
-    scanner_module = getattr(pept, "scanners", None)
-    if scanner_module is None:  # pragma: no cover - handled at runtime
-        raise RuntimeError("pept library does not expose scanners module")
-
-    loader = getattr(scanner_module, descriptor.scanner)
-
-    loader_args: list[Any] = []
-    loader_kwargs: dict[str, Any] = {}
     paths = [str(path) for path in descriptor.paths]
 
-    if descriptor.scanner == "parallel_screens":
-        separation = screen_separation if screen_separation is not None else descriptor.options.get("screen_separation")
-        if separation is None:
-            raise ValueError("screen_separation must be provided for parallel screens datasets")
-        loader_args = [paths[0] if len(paths) == 1 else paths]
-        loader_kwargs["screen_separation"] = separation
-    elif descriptor.scanner == "modular_camera":
-        loader_args = [paths[0]]
-    else:  # adac forte, default fallback
-        loader_args = [paths if len(paths) > 1 else paths[0]]
+    if descriptor.scanner == "pept_load":
+        if len(paths) != 1:
+            raise ValueError("pept.load expects a single file path")
+        raw_line_data = pept.load(paths[0])
+    else:
+        scanner_module = getattr(pept, "scanners", None)
+        if scanner_module is None:  # pragma: no cover - handled at runtime
+            raise RuntimeError("pept library does not expose scanners module")
 
-    raw_line_data = loader(*loader_args, **loader_kwargs)
+        loader = getattr(scanner_module, descriptor.scanner)
+
+        loader_args: list[Any] = []
+        loader_kwargs: dict[str, Any] = {}
+
+        if descriptor.scanner == "parallel_screens":
+            separation = screen_separation if screen_separation is not None else descriptor.options.get("screen_separation")
+            if separation is None:
+                raise ValueError("screen_separation must be provided for parallel screens datasets")
+            loader_args = [paths[0] if len(paths) == 1 else paths]
+            loader_kwargs["screen_separation"] = separation
+        elif descriptor.scanner == "modular_camera":
+            loader_args = [paths[0]]
+        else:  # adac forte, default fallback
+            loader_args = [paths if len(paths) > 1 else paths[0]]
+
+        raw_line_data = loader(*loader_args, **loader_kwargs)
     raw_array = _line_data_to_array(raw_line_data)
+    if descriptor.scanner == "pept_load":
+        raw_array = _ensure_lor_array(raw_array)
     masked = concatenate_and_mask([raw_array], time_mask)
     preview = decimate(masked, every=decimate_every)
 
@@ -247,3 +259,14 @@ def _line_data_to_array(line_data: Any) -> np.ndarray:
                 return np.concatenate(chunks, axis=0)
 
     return np.asarray(line_data)
+
+
+def _ensure_lor_array(array: np.ndarray) -> np.ndarray:
+    """Ensure the loaded data looks like a LoR array."""
+    if array.ndim != 2:
+        if array.size == 0:
+            return np.empty((0, 7))
+        raise ValueError("Loaded data must be a 2D array of LoRs")
+    if array.shape[1] < 7:
+        raise ValueError("Loaded data must contain at least 7 columns for LoRs")
+    return array
